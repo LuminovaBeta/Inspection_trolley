@@ -1,0 +1,298 @@
+import sys
+import os
+sys.path.append('/mnt/disk/elf/camera_ws/src/camera/camera')
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from std_msgs.msg import Int32
+import cv2
+
+#from ultralytics import YOLO
+from rknnlite.api import RKNNLite
+
+from queue import Queue
+import threading
+import time
+from control import pid_control
+from control import control
+import numpy as np
+
+
+
+
+# 队列
+Capture = Queue()
+info = Queue()
+last_img = Queue()
+img = Queue()
+
+# 图像尺寸(剪切)
+W_img = 800             #宽
+H_img = 600             #高
+image_area = W_img * H_img
+center_point = (W_img / 2, H_img / 2)
+
+# 拍照阈值
+Catch_max = 0.80
+Catch_min = 0.50
+clock = 1  # 拍照锁 默认上锁
+
+# PID 参数
+Servo_Kp = 0.5
+Servo_Ki = 0
+Servo_Kd = 0
+
+Lift_Kp = 1
+Lift_Ki = 0
+Lift_Kd = 0
+
+
+# 舵机和升降机
+limit_servo = (0, 180)        #us
+limit_lift = (0, 1600)     #半圈
+servo_angle = 0  # 舵机初始角度
+lift_angle  = 0  # 升降机初始角度
+
+# -------------------- Rknn 初始化 --------------------
+rknn_model = None
+
+def load_rknn_model():
+    global rknn_model
+    rknn_model = RKNNLite()
+    if rknn_model.load_rknn('/mnt/disk/elf/camera_ws/src/best.rknn') != 0:
+        print("RKNN 模型加载失败")
+        exit(-1)
+    if rknn_model.init_runtime(core_mask=RKNNLite.NPU_CORE_0) != 0:
+        print("RKNN 初始化失败")
+        exit(-1)
+    print("RKNN 模型初始化完成")
+
+def nms_boxes(boxes, scores, iou_threshold=0.4):
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+    areas = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(i)
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        inds = np.where(iou <= iou_threshold)[0]
+        order = order[inds + 1]
+    return keep
+
+def decode_output(outputs, conf_thres=0.25):
+    pred = outputs[0]  # shape: (1, 5, 8400)
+    pred = pred[0].transpose(1, 0)  # shape: (8400, 5)
+
+    # 筛选高置信度框
+    scores = pred[:, 4]
+    mask = scores > conf_thres
+    boxes = pred[mask][:, :4]
+    scores = scores[mask]
+
+    print('scores shape:', scores.shape)
+    print('mask shape:', mask.shape)
+
+    if len(boxes) == 0:
+        return np.array([]), np.array([])
+
+    # cx, cy, w, h → x1, y1, x2, y2
+    boxes_xyxy = np.zeros_like(boxes)
+    boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
+    boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
+    boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
+    boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
+
+    return boxes_xyxy, scores 
+
+
+# -------------------- ROS2 图像订阅者 --------------------
+class ImageReceiver(Node):
+    def __init__(self):
+        super().__init__('main_node')
+        self.subscription = self.create_subscription(
+            Image,
+            '/camera/image_raw',
+            self.listener_callback,
+            10
+        )
+        self.br = CvBridge()
+        self.get_logger().info("图像订阅节点启动")
+
+        self.subscription = self.create_subscription(
+            Int32,                                      
+            '/camera/switch_clock',
+            self.clock_callback,
+            10
+        )
+
+    def listener_callback(self, msg):
+        try:
+            frame = self.br.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if not Capture.full():
+                Capture.put(frame)
+        except Exception as e:
+            self.get_logger().error(f"[图像转换失败] {e}")
+    def clock_callback(self, msg):
+        global clock
+        clock = msg.data
+    
+
+
+
+# -------------------- 线程：YOLO识别 --------------------
+def process_images():
+    global rknn_model
+    while True:
+        if not Capture.empty():
+            img = Capture.get()
+            frame = cv2.resize(img, (W_img, H_img))
+            input_img = cv2.resize(frame, (640, 640))
+            input_img = cv2.cvtColor(input_img, cv2.COLOR_BGR2RGB)
+            input_img = np.expand_dims(input_img, axis=0)
+            input_img = input_img.astype(np.uint8)
+            outputs = rknn_model.inference(inputs=[input_img])
+            if outputs is None:
+                continue
+                
+            boxes, scores = decode_output(outputs)
+
+            valid_indices = np.where(scores > 0.01)[0]
+            if len(valid_indices) == 0:
+                continue
+            boxes = boxes[valid_indices]
+            scores = scores[valid_indices]
+            keep = nms_boxes(boxes, scores, 0.4)
+
+            for i in keep:
+                if scores[i] < 0.5:
+                    continue
+                x1, y1, x2, y2 = boxes[i].astype(int)
+                info.put((x1, y1, x2, y2))
+                last_img.put(frame)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+		img.put(frame)
+
+int(f"检测到目标: {scores[i]:.2f}, 坐标: ({x1}, {y1}), ({x2}, {y2})")
+
+
+
++
+        
+
+
+
+
+
+else:
+            time.sleep(0.01)
+
+# -------------------- 线程：控制逻辑 --------------------
+def control_job():
+    global clock
+    Last_error_S = 0
+    Integral_S = 0
+    Last_error_L = 0
+    Integral_L = 0
+    global servo_angle
+    global lift_angle
+
+
++
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+    while True:
+        if not info.empty():
+            x1, y1, x2, y2 = info.get()
+            target_point = ((x1 + x2) / 2, (y1 + y2) / 2)
+
+            Out_S, Last_error_S, Integral_S = pid_control(
+                target_point[0], center_point[0],
+                Servo_Kp, Servo_Ki, Servo_Kd,
+                Last_error_S, Integral_S)
+
+            Out_L, Last_error_L, Integral_L = pid_control(
+                target_point[1], center_point[1],
+                Lift_Kp, Lift_Ki, Lift_Kd,
+                Last_error_L, Integral_L)
+
+            servo_angle += Out_S
+            lift_angle += Out_L
+
+            # 限制舵机和升降机的角度
+            servo_angle = max(min(servo_angle, limit_servo[1]), limit_servo[0])
+            lift_angle = max(min(lift_angle, limit_lift[1]), limit_lift[0])
+
+            control(servo_angle, lift_angle)
+
+            target_area = (x2 - x1) * (y2 - y1)
+            ratio = target_area / image_area
+            if Catch_min <= ratio <= Catch_max and clock == 0:
+                clock = 1
+                print("拍照！")
+                cv2.imwrite("output.jpg", last_img.get())
+        else:
+            time.sleep(0.01)
+
+# -------------------- 主函数 --------------------
+def main():
+    rclpy.init()
+    node = ImageReceiver()
+    load_rknn_model()
+
+    
+    t1 = threading.Thread(target=process_images, daemon=True)
+    t2 = threading.Thread(target=control_job, daemon=True)
+    t1.start()
+    t2.start()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+        cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
+
+
